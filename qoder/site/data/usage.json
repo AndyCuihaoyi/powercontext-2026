@@ -1,0 +1,83 @@
+{
+  "generated_at": "2026-10-27T04:55:28.258390+00:00",
+  "generated_at_label": "2026-10-27 12:55 UTC+8",
+  "source": "GET http://127.0.0.1:8848/api/stats",
+  "scope": "开发期本机验证数据，不是外部用户数据",
+  "dataset": {
+    "documents": 5,
+    "chunks": 1318,
+    "pages": 462,
+    "chars": 1438159,
+    "queries": 57
+  },
+  "queries": {
+    "total": 57,
+    "p50_ms": 83.0,
+    "p95_ms": 1401.0,
+    "avg_ms": 299.2,
+    "modes": {
+      "extractive": 46,
+      "search": 11
+    }
+  },
+  "memory": {
+    "mode": "powercontext",
+    "available": true,
+    "scope_id": "scp_1xdtxr77pssa6gy4jb5ff1tta0"
+  },
+  "embedding": {
+    "backend": "fastembed",
+    "model": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+    "dim": 384
+  },
+  "verification": {
+    "ok": true,
+    "checks_passed": 24,
+    "checks_total": 24,
+    "generated_at": "2026-10-27T04:55:25.130359+00:00"
+  },
+  "recent_queries": [
+    {
+      "query": "供应链风险",
+      "latency_ms": 83,
+      "mode": "ask",
+      "answer_mode": "extractive",
+      "created_at": "2026-10-27T04:55:28"
+    },
+    {
+      "query": "supply chain risk",
+      "latency_ms": 54,
+      "mode": "ask",
+      "answer_mode": "extractive",
+      "created_at": "2026-10-27T04:55:27"
+    },
+    {
+      "query": "What are the main supply chain risks?",
+      "latency_ms": 67,
+      "mode": "ask",
+      "answer_mode": "extractive",
+      "created_at": "2026-10-27T04:55:27"
+    },
+    {
+      "query": "做财报研读时应该怎样记录证据？",
+      "latency_ms": 68,
+      "mode": "ask",
+      "answer_mode": "extractive",
+      "created_at": "2026-10-27T04:55:27"
+    },
+    {
+      "query": "波音 2022 年的商用飞机交付与订单情况如何？",
+      "latency_ms": 68,
+      "mode": "ask",
+      "answer_mode": "extractive",
+      "created_at": "2026-10-27T04:55:26"
+    },
+    {
+      "query": "3M 在 2022 年面临的主要供应链和原材料风险是什么？",
+      "latency_ms": 69,
+      "mode": "ask",
+      "answer_mode": "extractive",
+      "created_at": "2026-10-27T04:55:26"
+    }
+  ]
+}
