@@ -44,7 +44,7 @@ from powercontext.builtin.runtime.prepared_text import (
 from powercontext.builtin.runtime.recall_sufficiency import RecallBudgetView
 
 _MIN_TRUNCATED_CONTENT_BYTES = 64
-_EVIDENCE_MERGE_GAP = 4
+_EVIDENCE_MERGE_GAP = 480
 _ELLIPSIS = "…"
 _BEGIN_MARKER = "BEGIN_POWERCONTEXT_PREPARED_CONTEXT_V1"
 _END_MARKER = "END_POWERCONTEXT_PREPARED_CONTEXT_V1"
@@ -371,12 +371,63 @@ class PreparedContextBuilder:
 
         selected: list[tuple[int, int, int]] = []
         dropped_items = 0
-        for candidate in score_evidence(request.query, tuple(entry.text for entry in entries)):
-            trial = _merge_candidates((*selected, candidate))
-            if len(_render_evidence(entries, trial).encode("utf-8")) <= request.max_bytes:
-                selected = trial
-            else:
-                dropped_items += 1
+        ranked = score_evidence(request.query, tuple(entry.text for entry in entries))
+        grouped: dict[int, list[EvidenceCandidate]] = {}
+        for candidate in ranked:
+            grouped.setdefault(candidate.entry_order, []).append(candidate)
+        # Entries are visited in the ranker's priority order. Accepted positive candidates
+        # become anchors: when budget pressure later forces a choice, spans are kept or
+        # trimmed by how much accepted content they still cover, never by which candidate
+        # happened to trigger the overflow. While entries with positive candidates are still
+        # unplaced, each one holds a reservation so the first entry cannot price the rest
+        # out of the budget entirely.
+        anchors: dict[int, list[EvidenceCandidate]] = {}
+        positive_orders = {candidate.entry_order for candidate in ranked if candidate.score > 0.0}
+        for group in grouped.values():
+            for scored in (True, False):
+                for candidate in group:
+                    positive = candidate.score > 0.0
+                    if positive is not scored:
+                        continue
+                    if positive:
+                        placed_orders = {span[0] for span in selected}
+                        pending_after = len(positive_orders - placed_orders - {candidate.entry_order})
+                        budget = request.max_bytes - pending_after * _RESERVED_ITEM_BYTES
+                    else:
+                        budget = request.max_bytes
+                    trial = _merge_candidates((*selected, candidate))
+                    if len(_render_evidence(entries, trial).encode("utf-8")) <= budget:
+                        selected = trial
+                        if positive:
+                            anchors.setdefault(candidate.entry_order, []).append(candidate)
+                        continue
+                    if not positive:
+                        dropped_items += 1
+                        continue
+                    if not positive and not any(span[0] == candidate.entry_order for span in selected):
+                        dropped_items += 1
+                        continue
+                    merged = _merge_candidates((*selected, candidate))
+                    others = [span for span in merged if span[0] != candidate.entry_order]
+                    own = [span for span in merged if span[0] == candidate.entry_order]
+                    if len(own) == 1:
+                        fitted = _fit_merged_region(
+                            entries,
+                            others,
+                            candidate.entry_order,
+                            own[0][1],
+                            own[0][2],
+                            candidate,
+                            budget,
+                            anchors.get(candidate.entry_order, ()),
+                        )
+                    else:
+                        fitted = _fit_new_item(entries, selected, candidate, budget, anchors)
+                    if fitted is not None:
+                        selected = fitted
+                        anchors.setdefault(candidate.entry_order, []).append(candidate)
+                    else:
+                        dropped_items += 1
         if not selected:
             return PreparedContextBuild(
                 context=self.empty(),
@@ -824,6 +875,189 @@ def _merge_candidates(candidates: Sequence[EvidenceCandidate | tuple[int, int, i
                 current_start, current_end = start, end
         merged.append((entry_order, current_start, current_end))
     return merged
+
+
+_CANDIDATE_MASS_WEIGHT = 1.0
+_EVICTION_RATIO = 1.0
+_RESERVED_ITEM_BYTES = 0
+
+
+def _anchor_mass(anchors: Sequence[EvidenceCandidate], start: int, end: int) -> float:
+    """Accepted-candidate coverage of ``[start, end)``: score × overlapping fraction.
+
+    Anchors with a per-sentence breakdown contribute member by member, so the mass
+    distinguishes which part of a window a region keeps, not just whether it touches it.
+    """
+
+    mass = 0.0
+    for anchor in anchors:
+        if anchor.members:
+            for member_start, member_end, member_score in anchor.members:
+                overlap = min(end, member_end) - max(start, member_start)
+                if overlap > 0:
+                    mass += member_score * overlap / (member_end - member_start)
+            continue
+        overlap = min(end, anchor.end) - max(start, anchor.start)
+        if overlap > 0:
+            mass += anchor.score * overlap / (anchor.end - anchor.start)
+    return mass
+
+
+def _anchor_points(anchors: Sequence[EvidenceCandidate]) -> set[int]:
+    points: set[int] = set()
+    for anchor in anchors:
+        if anchor.members:
+            for member_start, member_end, _ in anchor.members:
+                points.update((member_start, member_end))
+        else:
+            points.update((anchor.start, anchor.end))
+    return points
+
+
+def _shrink_to_fit(
+    entries: Sequence[_EvidenceEntry],
+    fixed: Sequence[tuple[int, int, int]],
+    entry_order: int,
+    start: int,
+    end: int,
+    max_bytes: int,
+    anchors: Sequence[EvidenceCandidate],
+    candidate: EvidenceCandidate,
+) -> tuple[int, int] | None:
+    """Binary-search one edge of ``[start, end)`` off until the render fits the budget.
+
+    Both keep-sides are measured and ranked by accepted anchor mass first, candidate
+    mass second, so the trimmed result keeps the most committed content.
+    """
+
+    if end - start <= _MIN_TRUNCATED_CONTENT_BYTES:
+        return None
+
+    def fits(head: int, tail: int) -> bool:
+        trial = sorted((*fixed, (entry_order, head, tail)))
+        return len(_render_evidence(entries, trial).encode("utf-8")) <= max_bytes
+
+    def rank(head: int, tail: int) -> float:
+        return _anchor_mass(anchors, head, tail) + _CANDIDATE_MASS_WEIGHT * _anchor_mass((candidate,), head, tail)
+
+    best: tuple[int, int] | None = None
+    low, high = start, end - _MIN_TRUNCATED_CONTENT_BYTES
+    while low < high:
+        middle = (low + high) // 2
+        if fits(middle, end):
+            high = middle
+        else:
+            low = middle + 1
+    if fits(low, end):
+        best = (low, end)
+    low, high = start + _MIN_TRUNCATED_CONTENT_BYTES, end
+    while low < high:
+        middle = (low + high + 1) // 2
+        if fits(start, middle):
+            low = middle
+        else:
+            high = middle - 1
+    if fits(start, low) and (best is None or rank(start, low) >= rank(*best)):
+        best = (start, low)
+    return best
+
+
+def _fit_merged_region(
+    entries: Sequence[_EvidenceEntry],
+    others: Sequence[tuple[int, int, int]],
+    entry_order: int,
+    start: int,
+    end: int,
+    candidate: EvidenceCandidate,
+    max_bytes: int,
+    anchors: Sequence[EvidenceCandidate],
+) -> list[tuple[int, int, int]] | None:
+    """Pick the contiguous region of a merged span that fits and ranks best on
+    (accepted anchor mass, candidate mass, size).
+
+    The candidate merged into an existing span. Accepted content is never traded away:
+    anchor mass is the primary key, so the candidate only steers the cut placement on
+    ties — a span slightly over budget sheds its least valuable sentence rather than an
+    arbitrary edge, via the candidates' per-sentence member scores.
+    """
+
+    points = {start, end} | _anchor_points(anchors) | _anchor_points((candidate,))
+    ordered = sorted(point for point in points if start <= point <= end)
+    regions: list[tuple[float, float, int, int, int, int]] = []
+    for index, left in enumerate(ordered):
+        for right in ordered[index + 1 :]:
+            if right - left < _MIN_TRUNCATED_CONTENT_BYTES:
+                continue
+            regions.append(
+                (
+                    -(_anchor_mass(anchors, left, right) + _CANDIDATE_MASS_WEIGHT * _anchor_mass((candidate,), left, right)),
+                    left - right,
+                    -(min(right, candidate.end) - max(left, candidate.start)),
+                    left,
+                    right,
+                )
+            )
+    regions.sort()
+    for _, _, _, left, right in regions:
+        trial = sorted((*others, (entry_order, left, right)))
+        if len(_render_evidence(entries, trial).encode("utf-8")) <= max_bytes:
+            return trial
+    shrunk = _shrink_to_fit(entries, others, entry_order, start, end, max_bytes, anchors, candidate)
+    if shrunk is not None:
+        return sorted((*others, (entry_order, *shrunk)))
+    return None
+
+
+def _fit_new_item(
+    entries: Sequence[_EvidenceEntry],
+    selected: Sequence[tuple[int, int, int]],
+    candidate: EvidenceCandidate,
+    max_bytes: int,
+    anchors: dict[int, list[EvidenceCandidate]],
+) -> list[tuple[int, int, int]] | None:
+    """Make budget room for a candidate that opens a separate fragment.
+
+    Same entry: drop lowest-mass sibling spans (cumulatively) or shrink one by its
+    lighter edge. New entry: displace the globally weakest existing items (cumulatively),
+    but only while the candidate outweighs each evicted span's mass by the eviction ratio.
+    """
+
+    own = [span for span in selected if span[0] == candidate.entry_order]
+    others = [span for span in selected if span[0] != candidate.entry_order]
+    new_span = (candidate.entry_order, candidate.start, candidate.end)
+    if not own:
+        if not others:
+            return None
+        by_mass = sorted(
+            (
+                span
+                for span in others
+                if _anchor_mass(anchors.get(span[0], ()), span[1], span[2]) * _EVICTION_RATIO < candidate.score
+            ),
+            key=lambda span: _anchor_mass(anchors.get(span[0], ()), span[1], span[2]),
+        )
+        for drop_count in range(1, len(by_mass) + 1):
+            dropped = {id(span) for span in by_mass[:drop_count]}
+            trial = sorted((*[span for span in others if id(span) not in dropped], new_span))
+            if len(_render_evidence(entries, trial).encode("utf-8")) <= max_bytes:
+                return trial
+        return None
+    own_anchors = anchors.get(candidate.entry_order, ())
+    by_mass = sorted(
+        (span for span in own if _anchor_mass(own_anchors, span[1], span[2]) * _EVICTION_RATIO < candidate.score),
+        key=lambda span: _anchor_mass(own_anchors, span[1], span[2]),
+    )
+    for drop_count in range(1, len(by_mass) + 1):
+        dropped = {id(span) for span in by_mass[:drop_count]}
+        trial = sorted((*others, *[span for span in own if id(span) not in dropped], new_span))
+        if len(_render_evidence(entries, trial).encode("utf-8")) <= max_bytes:
+            return trial
+    for span in by_mass:
+        base = (*others, *[other for other in own if other != span], new_span)
+        shrunk = _shrink_to_fit(entries, base, span[0], span[1], span[2], max_bytes, own_anchors, candidate)
+        if shrunk is not None:
+            return sorted((*base, (span[0], *shrunk)))
+    return None
 
 
 def _render_evidence(entries: Sequence[_EvidenceEntry], spans: Sequence[tuple[int, int, int]]) -> str:
