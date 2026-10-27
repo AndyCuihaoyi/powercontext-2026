@@ -771,6 +771,10 @@ def _artifact_processing_bindings(  # noqa: C901 - validate and assemble one reg
             entrypoint = partial(run_family_worker, FamilyWorkerSpec(config=config, worker_security=worker_security))
         interval = None if family == "profile" else automatic[family]
         binding = canonical[family]
+        count_thresholds = {
+            "memory": config.runtime.memory_source_count_threshold,
+            "topic-memory": config.runtime.topic_memory_source_count_threshold,
+        }
         configured.append(
             ArtifactProcessingBinding(
                 binding_name=binding,
@@ -786,6 +790,7 @@ def _artifact_processing_bindings(  # noqa: C901 - validate and assemble one reg
                 pending_provider=None
                 if family == "skill"
                 else SourceProcessingPendingProvider(contexts.database, binding, family),
+                count_threshold=count_thresholds.get(family),
                 automatic_scope_filter=enabled_profile_scopes if family == "profile" else None,
             )
         )

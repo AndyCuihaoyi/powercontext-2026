@@ -473,6 +473,26 @@ class ScopedSourceApplication:
         return await self._capture(value)
 
     async def _capture(self, value: CaptureSource, /, *, handoff_receipt: bool = False) -> SourceReceipt:
+        receipt = await self._capture_locked(value, handoff_receipt=handoff_receipt)
+        self._wake_count_triggers()
+        return receipt
+
+    def _wake_count_triggers(self) -> None:
+        supervisor = self._runtime.artifact_processing_supervisor
+        if supervisor is None:
+            return
+        try:
+            supervisor.wake_count_triggers()
+        except Exception as error:
+            log_safely(
+                logger,
+                logging.WARNING,
+                "Source capture supervisor wake failed",
+                exc_info=error,
+                extra={"event": "source.capture.wake_failed", "unit": "artifact-processing"},
+            )
+
+    async def _capture_locked(self, value: CaptureSource, /, *, handoff_receipt: bool = False) -> SourceReceipt:
         if self._runtime._record_service is not None:
             try:
                 async with self._runtime._scope_operation(self.scope_id), self._runtime._locked(self.scope_id):
